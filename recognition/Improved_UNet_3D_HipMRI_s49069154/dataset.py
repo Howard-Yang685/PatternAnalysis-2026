@@ -10,7 +10,13 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
+
+try:
+    from torch.utils.data import Dataset
+except ImportError:  # Allows the lightweight audit CLI to run without PyTorch.
+    class Dataset:  # type: ignore[no-redef]
+        """Fallback base class used only when PyTorch is unavailable."""
 
 
 IMAGE_DIRECTORY = "semantic_MRs"
@@ -25,6 +31,7 @@ LABEL_NAMES = {
     4: "rectum",
     5: "prostate",
 }
+DEFAULT_TARGET_SHAPE = (64, 128, 128)  # (depth, height, width)
 DEFAULT_DATA_ROOT = Path(
     os.environ.get(
         "HIPMRI_DATA_ROOT",
@@ -193,6 +200,194 @@ def print_split_summary(split: DatasetSplit) -> None:
         print(f"  {name}: {len(patient_ids)} patients, {len(subset)} volumes")
 
 
+def _load_nifti_pair(pair: VolumePair) -> tuple[Any, Any, tuple[float, ...]]:
+    """Load one aligned NIfTI pair and return arrays in depth-height-width order."""
+    try:
+        import nibabel as nib
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "Loading HipMRI volumes requires nibabel and numpy. Install them with: "
+            "pip install nibabel numpy"
+        ) from exc
+
+    image_nifti = nib.as_closest_canonical(nib.load(str(pair.image_path)))
+    label_nifti = nib.as_closest_canonical(nib.load(str(pair.label_path)))
+    if image_nifti.shape != label_nifti.shape:
+        raise ValueError(
+            f"Shape mismatch for {pair.case_id}: "
+            f"{image_nifti.shape} vs {label_nifti.shape}."
+        )
+    if not np.allclose(image_nifti.affine, label_nifti.affine, atol=1e-4):
+        raise ValueError(f"Affine mismatch for {pair.case_id}.")
+
+    image_xyz = image_nifti.get_fdata(dtype=np.float32)
+    label_xyz = np.asanyarray(label_nifti.dataobj)
+    rounded_labels = np.rint(label_xyz)
+    if not np.allclose(label_xyz, rounded_labels, atol=1e-6):
+        raise ValueError(f"Non-integer semantic labels found in {pair.case_id}.")
+
+    label_xyz = rounded_labels.astype(np.int64, copy=False)
+    unexpected_labels = sorted(set(np.unique(label_xyz).tolist()) - set(LABEL_NAMES))
+    if unexpected_labels:
+        raise ValueError(
+            f"Unexpected semantic labels in {pair.case_id}: {unexpected_labels}."
+        )
+
+    # Nibabel uses (X, Y, Z); Conv3d expects spatial dimensions (D, H, W).
+    image_dhw = np.ascontiguousarray(np.transpose(image_xyz, (2, 1, 0)))
+    label_dhw = np.ascontiguousarray(np.transpose(label_xyz, (2, 1, 0)))
+    spacing_xyz = tuple(float(value) for value in image_nifti.header.get_zooms()[:3])
+    spacing_dhw = spacing_xyz[::-1]
+    return image_dhw, label_dhw, spacing_dhw
+
+
+def _normalise_mri(image: Any) -> Any:
+    """Apply per-volume z-score normalisation while preserving zero padding."""
+    import numpy as np
+
+    image = image.copy()
+    finite = np.isfinite(image)
+    foreground = finite & (image != 0)
+    normalisation_region = foreground if np.any(foreground) else finite
+    if not np.any(normalisation_region):
+        raise ValueError("MRI volume contains no finite voxels.")
+
+    mean = float(image[normalisation_region].mean())
+    standard_deviation = float(image[normalisation_region].std())
+    if standard_deviation < 1e-8:
+        raise ValueError("MRI intensity standard deviation is too close to zero.")
+
+    image[normalisation_region] = (
+        image[normalisation_region] - mean
+    ) / standard_deviation
+    image[~finite] = 0.0
+    image[~foreground] = 0.0
+    return image
+
+
+def _resize_volume(
+    image: Any,
+    label: Any,
+    target_shape: tuple[int, int, int] | None,
+) -> tuple[Any, Any]:
+    """Convert arrays to tensors and optionally resize image and label safely."""
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise RuntimeError(
+            "Training data loading requires PyTorch. Install it with: "
+            "pip install torch torchvision"
+        ) from exc
+
+    image_tensor = torch.from_numpy(image).to(dtype=torch.float32)[None, ...]
+    label_tensor = torch.from_numpy(label).to(dtype=torch.long)
+    if target_shape is None or tuple(image_tensor.shape[1:]) == target_shape:
+        return image_tensor, label_tensor
+    if len(target_shape) != 3 or any(dimension <= 0 for dimension in target_shape):
+        raise ValueError("target_shape must contain three positive dimensions.")
+
+    image_tensor = functional.interpolate(
+        image_tensor[None, ...],
+        size=target_shape,
+        mode="trilinear",
+        align_corners=False,
+    )[0]
+    label_tensor = functional.interpolate(
+        label_tensor[None, None, ...].to(dtype=torch.float32),
+        size=target_shape,
+        mode="nearest",
+    )[0, 0].to(dtype=torch.long)
+    return image_tensor, label_tensor
+
+
+class HipMRIDataset(Dataset):
+    """PyTorch-compatible dataset for aligned 3D HipMRI semantic segmentation."""
+
+    def __init__(
+        self,
+        pairs: Sequence[VolumePair],
+        target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
+        augment: bool = False,
+    ) -> None:
+        if not pairs:
+            raise ValueError("HipMRIDataset requires at least one volume pair.")
+        self.pairs = tuple(pairs)
+        self.target_shape = target_shape
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        import torch
+
+        pair = self.pairs[index]
+        image, label, spacing = _load_nifti_pair(pair)
+        image = _normalise_mri(image)
+        image_tensor, label_tensor = _resize_volume(
+            image, label, self.target_shape
+        )
+
+        # After canonical orientation and conversion to (D, H, W), the final
+        # axis is left-right. Other anatomical flips would be implausible.
+        if self.augment and bool(torch.rand(()) < 0.5):
+            image_tensor = torch.flip(image_tensor, dims=(3,))
+            label_tensor = torch.flip(label_tensor, dims=(2,))
+
+        return {
+            "image": image_tensor,
+            "label": label_tensor,
+            "case_id": pair.case_id,
+            "patient_id": pair.patient_id,
+            "spacing_dhw": spacing,
+            "image_path": str(pair.image_path),
+            "label_path": str(pair.label_path),
+        }
+
+
+def build_datasets(
+    data_root: str | Path,
+    target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
+    seed: int = 3710,
+) -> dict[str, HipMRIDataset]:
+    """Build leakage-free training, validation, and test datasets."""
+    pairs, missing_labels, missing_images = discover_volume_pairs(data_root)
+    if missing_labels or missing_images:
+        raise ValueError(
+            "Cannot build datasets while unmatched MRI or label files remain."
+        )
+
+    split = split_by_patient(pairs, seed=seed)
+    return {
+        "train": HipMRIDataset(
+            split.train, target_shape=target_shape, augment=True
+        ),
+        "validation": HipMRIDataset(
+            split.validation, target_shape=target_shape, augment=False
+        ),
+        "test": HipMRIDataset(
+            split.test, target_shape=target_shape, augment=False
+        ),
+    }
+
+
+def print_sample_summary(sample: dict[str, Any]) -> None:
+    """Print a compact smoke-test summary for one loaded training sample."""
+    import torch
+
+    image = sample["image"]
+    label = sample["label"]
+    print("\nData-loader smoke test:")
+    print(f"  case: {sample['case_id']}")
+    print(f"  patient: {sample['patient_id']}")
+    print(f"  image tensor: shape={tuple(image.shape)}, dtype={image.dtype}")
+    print(f"  label tensor: shape={tuple(label.shape)}, dtype={label.dtype}")
+    print(f"  image mean/std: {float(image.mean()):.4f} / {float(image.std()):.4f}")
+    print(f"  labels after resize: {torch.unique(label).tolist()}")
+
+
 def _inspect_pair(pair: VolumePair, include_label_values: bool) -> dict[str, object]:
     """Read NIfTI metadata and optionally inspect the semantic label values."""
     try:
@@ -323,6 +518,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3710,
         help="Random seed used for the patient-level split.",
     )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Load and preprocess one training case to verify the data pipeline.",
+    )
+    parser.add_argument(
+        "--target-shape",
+        type=int,
+        nargs=3,
+        default=DEFAULT_TARGET_SHAPE,
+        metavar=("DEPTH", "HEIGHT", "WIDTH"),
+        help="Downsampled Conv3d input shape (default: 64 128 128).",
+    )
     return parser
 
 
@@ -333,9 +541,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         inspect_limit=args.inspect_limit,
         include_label_values=not args.metadata_only,
     )
-    if args.show_split:
+    if args.show_split or args.smoke_test:
         pairs, _, _ = discover_volume_pairs(args.data_root)
-        print_split_summary(split_by_patient(pairs, seed=args.seed))
+        split = split_by_patient(pairs, seed=args.seed)
+        print_split_summary(split)
+        if args.smoke_test:
+            dataset = HipMRIDataset(
+                split.train,
+                target_shape=tuple(args.target_shape),
+                augment=False,
+            )
+            print_sample_summary(dataset[0])
     return 0 if success else 1
 
 
