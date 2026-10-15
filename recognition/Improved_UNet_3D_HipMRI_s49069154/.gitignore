@@ -7,3 +7,5 @@ results/
 *.pt
 *.pth
 *.ckpt
+*.out
+*.err
