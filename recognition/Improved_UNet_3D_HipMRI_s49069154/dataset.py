@@ -1,7 +1,7 @@
-"""HipMRI NIfTI discovery and dataset auditing utilities.
+"""HipMRI NIfTI discovery, auditing, and patient-level splitting utilities.
 
-The training dataset class will be added after this audit has confirmed the
-actual volume shapes, voxel spacing, affine alignment, and semantic label IDs.
+The split is performed by patient rather than by scan so that repeated weekly
+examinations from one person can never leak across dataset partitions.
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ IMAGE_DIRECTORY = "semantic_MRs"
 LABEL_DIRECTORY = "semantic_labels_only"
 IMAGE_SUFFIX = "_LFOV.nii.gz"
 LABEL_SUFFIX = "_SEMANTIC.nii.gz"
+LABEL_NAMES = {
+    0: "background",
+    1: "bladder",
+    2: "body",
+    3: "bone",
+    4: "rectum",
+    5: "prostate",
+}
 DEFAULT_DATA_ROOT = Path(
     os.environ.get(
         "HIPMRI_DATA_ROOT",
@@ -33,6 +41,15 @@ class VolumePair:
     patient_id: str
     image_path: Path
     label_path: Path
+
+
+@dataclass(frozen=True)
+class DatasetSplit:
+    """Leakage-free train, validation, and test volume assignments."""
+
+    train: tuple[VolumePair, ...]
+    validation: tuple[VolumePair, ...]
+    test: tuple[VolumePair, ...]
 
 
 def _case_id(path: Path, suffix: str) -> str:
@@ -97,6 +114,85 @@ def discover_volume_pairs(
     return pairs, missing_labels, missing_images
 
 
+def _partition_counts(total: int, fractions: Sequence[float]) -> list[int]:
+    """Convert fractions into counts while preserving the requested total."""
+    raw_counts = [total * fraction for fraction in fractions]
+    counts = [int(value) for value in raw_counts]
+    unassigned = total - sum(counts)
+    remainder_order = sorted(
+        range(len(fractions)),
+        key=lambda index: (raw_counts[index] - counts[index], -index),
+        reverse=True,
+    )
+    for index in remainder_order[:unassigned]:
+        counts[index] += 1
+    return counts
+
+
+def split_by_patient(
+    pairs: Sequence[VolumePair],
+    fractions: tuple[float, float, float] = (0.70, 0.15, 0.15),
+    seed: int = 3710,
+) -> DatasetSplit:
+    """Create deterministic train/validation/test splits without patient leakage."""
+    import random
+
+    if not pairs:
+        raise ValueError("Cannot split an empty dataset.")
+    if any(fraction <= 0 for fraction in fractions):
+        raise ValueError("All split fractions must be greater than zero.")
+    if abs(sum(fractions) - 1.0) > 1e-8:
+        raise ValueError("Train, validation, and test fractions must sum to 1.0.")
+
+    patient_ids = sorted({pair.patient_id for pair in pairs})
+    if len(patient_ids) < 3:
+        raise ValueError("At least three patients are required for three dataset splits.")
+
+    random.Random(seed).shuffle(patient_ids)
+    train_count, validation_count, test_count = _partition_counts(
+        len(patient_ids), fractions
+    )
+    if min(train_count, validation_count, test_count) == 0:
+        raise ValueError("The requested fractions leave one dataset split empty.")
+
+    train_end = train_count
+    validation_end = train_end + validation_count
+    split_patients = {
+        "train": set(patient_ids[:train_end]),
+        "validation": set(patient_ids[train_end:validation_end]),
+        "test": set(patient_ids[validation_end : validation_end + test_count]),
+    }
+
+    overlap = (
+        (split_patients["train"] & split_patients["validation"])
+        | (split_patients["train"] & split_patients["test"])
+        | (split_patients["validation"] & split_patients["test"])
+    )
+    if overlap:
+        raise RuntimeError(f"Patient leakage detected: {sorted(overlap)}")
+
+    def select(patient_set: set[str]) -> tuple[VolumePair, ...]:
+        return tuple(pair for pair in pairs if pair.patient_id in patient_set)
+
+    return DatasetSplit(
+        train=select(split_patients["train"]),
+        validation=select(split_patients["validation"]),
+        test=select(split_patients["test"]),
+    )
+
+
+def print_split_summary(split: DatasetSplit) -> None:
+    """Print patient and volume counts for a dataset split."""
+    print("\nPatient-level split:")
+    for name, subset in (
+        ("train", split.train),
+        ("validation", split.validation),
+        ("test", split.test),
+    ):
+        patient_ids = {pair.patient_id for pair in subset}
+        print(f"  {name}: {len(patient_ids)} patients, {len(subset)} volumes")
+
+
 def _inspect_pair(pair: VolumePair, include_label_values: bool) -> dict[str, object]:
     """Read NIfTI metadata and optionally inspect the semantic label values."""
     try:
@@ -155,6 +251,9 @@ def audit_dataset(
     print(f"Unique patients: {patient_count}")
     print(f"MRI volumes without labels: {len(missing_labels)}")
     print(f"Labels without MRI volumes: {len(missing_images)}")
+    print("Semantic labels:")
+    for label_id, name in LABEL_NAMES.items():
+        print(f"  {label_id}: {name}")
 
     if missing_labels:
         print("Missing labels (first 10):", ", ".join(missing_labels[:10]))
@@ -213,6 +312,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip loading label arrays and only compare NIfTI metadata.",
     )
+    parser.add_argument(
+        "--show-split",
+        action="store_true",
+        help="Print the deterministic patient-level train/validation/test split.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=3710,
+        help="Random seed used for the patient-level split.",
+    )
     return parser
 
 
@@ -223,6 +333,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         inspect_limit=args.inspect_limit,
         include_label_values=not args.metadata_only,
     )
+    if args.show_split:
+        pairs, _, _ = discover_volume_pairs(args.data_root)
+        print_split_summary(split_by_patient(pairs, seed=args.seed))
     return 0 if success else 1
 
 
