@@ -27,11 +27,12 @@ python -u train.py \
   --batch-size 1 \
   --learning-rate 3e-4 \
   --weight-decay 1e-5 \
-  --base-channels 16 \
-  --target-shape 64 128 128 \
+  --base-channels 12 \
+  --target-shape 80 128 128 \
   --num-workers 4 \
   --seed 3710 \
   --patience 20 \
   --device cuda \
   --amp \
-  --output-dir "results/$MODEL"
+  --selection-metric prostate_dice \
+  --output-dir "results/${MODEL}_enhanced"

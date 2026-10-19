@@ -7,6 +7,7 @@ examinations from one person can never leak across dataset partitions.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,9 @@ LABEL_NAMES = {
     4: "rectum",
     5: "prostate",
 }
-DEFAULT_TARGET_SHAPE = (64, 128, 128)  # (depth, height, width)
+# Retain more small-organ and boundary detail than the original 64 x 128 x 128
+# setting while remaining practical on a 12 GB consumer GPU.
+DEFAULT_TARGET_SHAPE = (80, 128, 128)  # (depth, height, width)
 DEFAULT_DATA_ROOT = Path(
     os.environ.get(
         "HIPMRI_DATA_ROOT",
@@ -302,6 +305,73 @@ def _resize_volume(
     return image_tensor, label_tensor
 
 
+def _augment_training_pair(image: Any, label: Any) -> tuple[Any, Any]:
+    """Apply mild anatomy-preserving spatial and MRI intensity augmentation."""
+    import torch
+    import torch.nn.functional as functional
+
+    # After canonical orientation and conversion to (D, H, W), the final axis
+    # is left-right. Other anatomical flips would be implausible.
+    if bool(torch.rand(()) < 0.5):
+        image = torch.flip(image, dims=(3,))
+        label = torch.flip(label, dims=(2,))
+
+    # Small rotations, translations, and isotropic scaling model acquisition
+    # and positioning variation without changing the anatomy drastically.
+    if bool(torch.rand(()) < 0.35):
+        maximum_angle = math.radians(6.0)
+        angles = [
+            float((2.0 * torch.rand(()) - 1.0) * maximum_angle)
+            for _ in range(3)
+        ]
+        sin_x, sin_y, sin_z = (math.sin(angle) for angle in angles)
+        cos_x, cos_y, cos_z = (math.cos(angle) for angle in angles)
+        rotation_x = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, cos_x, -sin_x], [0.0, sin_x, cos_x]],
+            dtype=image.dtype,
+        )
+        rotation_y = torch.tensor(
+            [[cos_y, 0.0, sin_y], [0.0, 1.0, 0.0], [-sin_y, 0.0, cos_y]],
+            dtype=image.dtype,
+        )
+        rotation_z = torch.tensor(
+            [[cos_z, -sin_z, 0.0], [sin_z, cos_z, 0.0], [0.0, 0.0, 1.0]],
+            dtype=image.dtype,
+        )
+        scale = float(0.95 + 0.10 * torch.rand(()))
+        theta = torch.zeros((1, 3, 4), dtype=image.dtype)
+        theta[0, :, :3] = (rotation_z @ rotation_y @ rotation_x) * scale
+        theta[0, :, 3] = 0.08 * torch.rand(3, dtype=image.dtype) - 0.04
+        grid = functional.affine_grid(
+            theta,
+            size=(1, 1, *image.shape[1:]),
+            align_corners=False,
+        )
+        image = functional.grid_sample(
+            image[None, ...],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )[0]
+        label = functional.grid_sample(
+            label[None, None, ...].to(dtype=image.dtype),
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=False,
+        )[0, 0].to(dtype=torch.long)
+
+    # Scanner-dependent contrast and noise variation. Keep zero padding at zero.
+    foreground = image != 0
+    intensity_scale = 0.90 + 0.20 * torch.rand(())
+    intensity_shift = 0.20 * torch.rand(()) - 0.10
+    noise = torch.randn_like(image) * 0.03
+    augmented = image * intensity_scale + intensity_shift + noise
+    image = torch.where(foreground, augmented, image)
+    return image.contiguous(), label.contiguous()
+
+
 class HipMRIDataset(Dataset):
     """PyTorch-compatible dataset for aligned 3D HipMRI semantic segmentation."""
 
@@ -330,11 +400,10 @@ class HipMRIDataset(Dataset):
             image, label, self.target_shape
         )
 
-        # After canonical orientation and conversion to (D, H, W), the final
-        # axis is left-right. Other anatomical flips would be implausible.
-        if self.augment and bool(torch.rand(()) < 0.5):
-            image_tensor = torch.flip(image_tensor, dims=(3,))
-            label_tensor = torch.flip(label_tensor, dims=(2,))
+        if self.augment:
+            image_tensor, label_tensor = _augment_training_pair(
+                image_tensor, label_tensor
+            )
 
         return {
             "image": image_tensor,
@@ -529,7 +598,10 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=3,
         default=DEFAULT_TARGET_SHAPE,
         metavar=("DEPTH", "HEIGHT", "WIDTH"),
-        help="Downsampled Conv3d input shape (default: 64 128 128).",
+        help=(
+            "Downsampled Conv3d input shape "
+            f"(default: {' '.join(map(str, DEFAULT_TARGET_SHAPE))})."
+        ),
     )
     return parser
 

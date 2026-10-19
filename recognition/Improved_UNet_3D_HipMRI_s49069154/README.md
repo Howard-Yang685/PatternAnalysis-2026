@@ -2,9 +2,26 @@
 
 This project investigates whether an improved three-dimensional U-Net can provide clinically meaningful prostate boundary improvements over a standard 3D U-Net baseline on the HipMRI dataset.
 
-## Project status
+## Enhanced training configuration
 
-The repository structure has been initialised. The next milestone is to audit the NIfTI images and labels, verify image-mask alignment, and construct a reproducible patient-level train/validation/test split.
+The enhanced experiment retains more boundary detail by resizing volumes to
+`80 x 128 x 128` rather than `64 x 128 x 128`. Training uses mild
+anatomy-preserving affine and MRI intensity augmentation. The combined loss is
+60% foreground soft Dice and 40% class-weighted cross-entropy, with larger
+weights for the under-represented rectum and prostate. Checkpoints are selected
+using validation prostate Dice; the test partition is not used for model
+selection. The added depth resolution specifically retains more base/apex
+detail. The enhanced run uses 12 base feature channels so that the extra
+spatial detail fits reliably on a 12 GB GPU.
+
+The earlier results are preserved by writing the new run to
+`results/improved_enhanced` by default.
+
+Example local training command (PowerShell):
+
+```powershell
+python train.py --model improved --data-root F:\COMP3710_Data\HipMRI_Study_open --device cuda --amp --num-workers 2 --output-dir results/improved_enhanced
+```
 
 ## Planned comparison
 

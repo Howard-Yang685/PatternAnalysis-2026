@@ -15,11 +15,15 @@ import torch.nn.functional as functional
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from dataset import DEFAULT_DATA_ROOT, LABEL_NAMES, build_datasets
+from dataset import DEFAULT_DATA_ROOT, DEFAULT_TARGET_SHAPE, LABEL_NAMES, build_datasets
 from modules import build_model, count_trainable_parameters
 
 
 NUM_CLASSES = len(LABEL_NAMES)
+# Derived from the training-set class frequencies using a deliberately capped,
+# inverse-frequency-style weighting. This reduces background dominance without
+# allowing the two smallest structures to destabilise optimisation.
+DEFAULT_CLASS_WEIGHTS = (0.10, 0.20, 0.50, 1.00, 2.00, 2.50)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,10 @@ class TrainingConfig:
     seed: int
     patience: int
     amp: bool
+    class_weights: tuple[float, ...]
+    cross_entropy_weight: float
+    dice_weight: float
+    selection_metric: str
 
 
 class SegmentationMeter:
@@ -103,22 +111,50 @@ def soft_dice_loss(logits: Tensor, target: Tensor) -> Tensor:
     return 1.0 - class_dice[1:].mean()
 
 
-def segmentation_loss(logits: Tensor, target: Tensor) -> Tensor:
+def segmentation_loss(
+    logits: Tensor,
+    target: Tensor,
+    class_weights: Tensor,
+    cross_entropy_weight: float,
+    dice_weight: float,
+) -> Tensor:
     """Balance voxel-wise classification with region-overlap optimisation."""
-    cross_entropy = functional.cross_entropy(logits, target)
+    cross_entropy = functional.cross_entropy(logits, target, weight=class_weights)
     dice = soft_dice_loss(logits, target)
-    return 0.5 * cross_entropy + 0.5 * dice
+    weight_sum = cross_entropy_weight + dice_weight
+    return (
+        cross_entropy_weight * cross_entropy + dice_weight * dice
+    ) / weight_sum
 
 
-def supervised_loss(outputs: Tensor | tuple[Tensor, ...], target: Tensor) -> Tensor:
+def supervised_loss(
+    outputs: Tensor | tuple[Tensor, ...],
+    target: Tensor,
+    class_weights: Tensor,
+    cross_entropy_weight: float,
+    dice_weight: float,
+) -> Tensor:
     """Apply decreasing weights to the main and deep-supervision outputs."""
     if isinstance(outputs, Tensor):
-        return segmentation_loss(outputs, target)
+        return segmentation_loss(
+            outputs,
+            target,
+            class_weights,
+            cross_entropy_weight,
+            dice_weight,
+        )
 
     weights = (1.0, 0.5, 0.25)
     active_weights = weights[: len(outputs)]
     weighted_losses = [
-        weight * segmentation_loss(output, target)
+        weight
+        * segmentation_loss(
+            output,
+            target,
+            class_weights,
+            cross_entropy_weight,
+            dice_weight,
+        )
         for weight, output in zip(active_weights, outputs)
     ]
     return sum(weighted_losses) / sum(active_weights)
@@ -196,6 +232,9 @@ def train_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     amp_enabled: bool,
+    class_weights: Tensor,
+    cross_entropy_weight: float,
+    dice_weight: float,
     maximum_batches: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
     model.train()
@@ -214,7 +253,13 @@ def train_epoch(
             enabled=amp_enabled,
         ):
             outputs = model(image)
-            loss = supervised_loss(outputs, target)
+            loss = supervised_loss(
+                outputs,
+                target,
+                class_weights,
+                cross_entropy_weight,
+                dice_weight,
+            )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -236,6 +281,9 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
+    class_weights: Tensor,
+    cross_entropy_weight: float,
+    dice_weight: float,
     maximum_batches: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
     model.eval()
@@ -252,7 +300,13 @@ def evaluate(
             enabled=amp_enabled,
         ):
             outputs = model(image)
-            loss = supervised_loss(outputs, target)
+            loss = supervised_loss(
+                outputs,
+                target,
+                class_weights,
+                cross_entropy_weight,
+                dice_weight,
+            )
         logits = primary_logits(outputs)
         meter.update(logits, target)
         running_loss += float(loss)
@@ -287,6 +341,15 @@ def save_checkpoint(
 
 def save_json(path: Path, contents: Any) -> None:
     path.write_text(json.dumps(contents, indent=2), encoding="utf-8")
+
+
+def selection_score(metrics: dict[str, Any], metric_name: str) -> float:
+    """Return the validation score used for scheduling and checkpointing."""
+    if metric_name == "prostate_dice":
+        return float(metrics["per_class"]["prostate"]["dice"])
+    if metric_name == "mean_foreground_dice":
+        return float(metrics["mean_foreground_dice"])
+    raise ValueError(f"Unsupported selection metric: {metric_name}")
 
 
 def plot_history(history: list[dict[str, float]], output_path: Path) -> None:
@@ -351,16 +414,24 @@ def run_training(
     )
     amp_enabled = config.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
+    class_weights = torch.tensor(
+        config.class_weights,
+        dtype=torch.float32,
+        device=device,
+    )
 
     checkpoint_path = output_dir / "best_model.pt"
     history: list[dict[str, float]] = []
-    best_validation_dice = -1.0
+    best_validation_score = -1.0
     epochs_without_improvement = 0
 
     print(f"Device: {device}")
     print(f"Model: {config.model}")
     print(f"Trainable parameters: {count_trainable_parameters(model):,}")
     print(f"AMP enabled: {amp_enabled}")
+    print(f"Target shape: {config.target_shape}")
+    print(f"Class weights: {config.class_weights}")
+    print(f"Checkpoint selection: {config.selection_metric}")
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -374,6 +445,9 @@ def run_training(
             scaler,
             device,
             amp_enabled,
+            class_weights,
+            config.cross_entropy_weight,
+            config.dice_weight,
             maximum_batches=maximum_train_batches,
         )
         validation_loss, validation_metrics = evaluate(
@@ -381,10 +455,19 @@ def run_training(
             loaders["validation"],
             device,
             amp_enabled,
+            class_weights,
+            config.cross_entropy_weight,
+            config.dice_weight,
             maximum_batches=maximum_validation_batches,
         )
         validation_dice = validation_metrics["mean_foreground_dice"]
-        scheduler.step(validation_dice)
+        validation_prostate_dice = validation_metrics["per_class"]["prostate"][
+            "dice"
+        ]
+        validation_score = selection_score(
+            validation_metrics, config.selection_metric
+        )
+        scheduler.step(validation_score)
         epoch_seconds = time.perf_counter() - epoch_start
 
         history.append(
@@ -394,6 +477,11 @@ def run_training(
                 "validation_loss": validation_loss,
                 "train_foreground_dice": train_metrics["mean_foreground_dice"],
                 "validation_foreground_dice": validation_dice,
+                "train_prostate_dice": train_metrics["per_class"]["prostate"][
+                    "dice"
+                ],
+                "validation_prostate_dice": validation_prostate_dice,
+                "selection_score": validation_score,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "seconds": epoch_seconds,
             }
@@ -405,11 +493,12 @@ def run_training(
             f"train loss {train_loss:.4f} dice "
             f"{train_metrics['mean_foreground_dice']:.4f} | "
             f"val loss {validation_loss:.4f} dice {validation_dice:.4f} | "
+            f"val prostate {validation_prostate_dice:.4f} | "
             f"{epoch_seconds:.1f}s"
         )
 
-        if validation_dice > best_validation_dice:
-            best_validation_dice = validation_dice
+        if validation_score > best_validation_score:
+            best_validation_score = validation_score
             epochs_without_improvement = 0
             save_checkpoint(
                 checkpoint_path,
@@ -433,6 +522,9 @@ def run_training(
         loaders["test"],
         device,
         amp_enabled,
+        class_weights,
+        config.cross_entropy_weight,
+        config.dice_weight,
         maximum_batches=maximum_test_batches,
     )
     peak_vram_mb = (
@@ -443,6 +535,8 @@ def run_training(
     results = {
         "best_epoch": checkpoint["epoch"],
         "best_validation_metrics": checkpoint["validation_metrics"],
+        "selection_metric": config.selection_metric,
+        "best_validation_score": best_validation_score,
         "test_loss": test_loss,
         "test_metrics": test_metrics,
         "trainable_parameters": count_trainable_parameters(model),
@@ -465,23 +559,44 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="Result directory (default: results/<model>).",
+        help="Result directory (default: results/<model>_enhanced).",
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument(
+        "--base-channels",
+        type=int,
+        default=12,
+        help="Base feature width (12 leaves memory for the enhanced resolution).",
+    )
     parser.add_argument(
         "--target-shape",
         type=int,
         nargs=3,
-        default=(64, 128, 128),
+        default=DEFAULT_TARGET_SHAPE,
         metavar=("DEPTH", "HEIGHT", "WIDTH"),
     )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=3710)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument(
+        "--class-weights",
+        type=float,
+        nargs=NUM_CLASSES,
+        default=DEFAULT_CLASS_WEIGHTS,
+        metavar=tuple(LABEL_NAMES.values()),
+        help="Cross-entropy weights in semantic-label order.",
+    )
+    parser.add_argument("--cross-entropy-weight", type=float, default=0.4)
+    parser.add_argument("--dice-weight", type=float, default=0.6)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("prostate_dice", "mean_foreground_dice"),
+        default="prostate_dice",
+        help="Validation metric used for LR scheduling, early stopping, and checkpoints.",
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument(
         "--amp",
@@ -516,11 +631,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("epochs, batch-size, and base-channels must be positive.")
     if args.patience <= 0:
         raise ValueError("patience must be positive.")
+    if any(weight <= 0 for weight in args.class_weights):
+        raise ValueError("Every class weight must be positive.")
+    if args.cross_entropy_weight < 0 or args.dice_weight < 0:
+        raise ValueError("Loss-component weights cannot be negative.")
+    if args.cross_entropy_weight + args.dice_weight <= 0:
+        raise ValueError("At least one loss-component weight must be positive.")
 
     config = TrainingConfig(
         model=args.model,
         data_root=str(args.data_root),
-        output_dir=str(args.output_dir or Path("results") / args.model),
+        output_dir=str(
+            args.output_dir or Path("results") / f"{args.model}_enhanced"
+        ),
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -531,6 +654,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         patience=args.patience,
         amp=args.amp,
+        class_weights=tuple(args.class_weights),
+        cross_entropy_weight=args.cross_entropy_weight,
+        dice_weight=args.dice_weight,
+        selection_metric=args.selection_metric,
     )
     set_reproducibility(config.seed)
     device = select_device(args.device)
