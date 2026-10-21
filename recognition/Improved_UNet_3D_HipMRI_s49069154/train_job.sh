@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=hipmri-train
 #SBATCH --partition=comp3710
+#SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
