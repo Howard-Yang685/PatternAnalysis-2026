@@ -2,9 +2,7 @@
 #SBATCH --job-name=hipmri-smoke
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=16G
+#SBATCH --gres=gpu
 #SBATCH --time=00:10:00
 #SBATCH --output=gpu_smoke_%j.out
 #SBATCH --error=gpu_smoke_%j.err
