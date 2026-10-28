@@ -1,6 +1,9 @@
 # 3D Improved U-Net for HipMRI Prostate Segmentation
 
-This project investigates whether an improved three-dimensional U-Net can provide clinically meaningful prostate boundary improvements over a standard 3D U-Net baseline on the HipMRI dataset.
+This project compares a basic slice-wise 2D U-Net, a standard 3D U-Net, and an
+improved 3D U-Net on the HipMRI dataset. The first comparison measures the value
+of volumetric context; the second isolates the residual and deep-supervision
+changes in the improved architecture.
 
 ## Enhanced training configuration
 
@@ -23,10 +26,21 @@ Example local training command (PowerShell):
 python train.py --model improved --data-root F:\COMP3710_Data\HipMRI_Study_open --device cuda --amp --num-workers 2 --output-dir results/improved_enhanced
 ```
 
+The 2D baseline uses the same resized volumes and leakage-free patient split.
+Each volume is converted into an ordered batch of axial slices immediately
+before the model forward pass, and its predictions are reassembled into a 3D
+label volume for the same case-, patient-, and boundary-level evaluation.
+
+```powershell
+python train.py --model 2d --data-root F:\COMP3710_Data\HipMRI_Study_open --device cuda --amp --num-workers 2 --output-dir results/2d_baseline --target-shape 64 128 128 --base-channels 16 --augmentation basic --class-weights 1 1 1 1 1 1 --cross-entropy-weight 0.5 --dice-weight 0.5 --selection-metric mean_foreground_dice
+python predict.py --checkpoint results\2d_baseline\best_model.pt --data-root F:\COMP3710_Data\HipMRI_Study_open --output-dir results\2d_baseline\inference --device cuda
+```
+
 ## Planned comparison
 
-- Baseline: standard 3D U-Net.
-- Proposed model: 3D Improved U-Net with residual units and deep supervision.
+- Basic reference: slice-wise 2D U-Net.
+- Volumetric baseline: standard 3D U-Net.
+- Proposed model: improved 3D U-Net with residual units and deep supervision.
 - Primary metrics: per-class Dice similarity coefficient and Intersection over Union.
 - Efficiency measures: parameter count, peak GPU memory, and per-volume inference time.
 - Qualitative analysis: 3-5 representative boundary failures, with particular attention to prostate base and apex slices.

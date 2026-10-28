@@ -1,4 +1,4 @@
-"""Evaluate saved 3D segmentation models and create report-ready outputs."""
+"""Evaluate saved 2D or 3D segmentation models and create report outputs."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as functional
 
 from dataset import DEFAULT_DATA_ROOT, LABEL_NAMES, build_datasets
-from modules import build_model
+from modules import UNet2D, build_model
 
 
 PROSTATE_CLASS = 5
@@ -70,7 +70,10 @@ def predict_volume(
     amp_enabled: bool,
 ) -> tuple[torch.Tensor, float]:
     """Return a CPU label map and model-only inference time in milliseconds."""
-    image = image.unsqueeze(0).to(device, non_blocking=True)
+    if isinstance(model, UNet2D):
+        model_input = image.permute(1, 0, 2, 3).to(device, non_blocking=True)
+    else:
+        model_input = image.unsqueeze(0).to(device, non_blocking=True)
     _synchronise(device)
     start = time.perf_counter()
     with torch.inference_mode(), torch.autocast(
@@ -78,12 +81,14 @@ def predict_volume(
         dtype=torch.float16,
         enabled=amp_enabled,
     ):
-        outputs = model(image)
+        outputs = model(model_input)
         logits = outputs[0] if isinstance(outputs, tuple) else outputs
         prediction = logits.argmax(dim=1)
     _synchronise(device)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return prediction[0].cpu(), elapsed_ms
+    if not isinstance(model, UNet2D):
+        prediction = prediction[0]
+    return prediction.cpu(), elapsed_ms
 
 
 def warm_up_model(
@@ -94,7 +99,12 @@ def warm_up_model(
     repetitions: int = 2,
 ) -> None:
     """Exclude one-time CUDA initialisation from reported latency."""
-    image = image.unsqueeze(0).to(device)
+    if isinstance(model, UNet2D):
+        # A small ordered slice batch is sufficient to initialise 2D CUDA kernels.
+        model_input = image[:, : min(8, image.shape[1])].permute(1, 0, 2, 3)
+        model_input = model_input.to(device)
+    else:
+        model_input = image.unsqueeze(0).to(device)
     with torch.inference_mode():
         for _ in range(repetitions):
             with torch.autocast(
@@ -102,7 +112,7 @@ def warm_up_model(
                 dtype=torch.float16,
                 enabled=amp_enabled,
             ):
-                model(image)
+                model(model_input)
     _synchronise(device)
 
 
@@ -358,12 +368,44 @@ def summarise_records(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
             for metric in ("dice", "iou")
         }
     inference_times = [float(record["inference_ms"]) for record in records]
+    records_by_patient: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        records_by_patient.setdefault(str(record["patient_id"]), []).append(record)
+
+    patient_metric_means = {
+        name: _mean_present(
+            [
+                _mean_present([record[name] for record in patient_records])
+                for patient_records in records_by_patient.values()
+            ]
+        )
+        for name in metric_names
+    }
+    patient_class_means: dict[str, dict[str, float | None]] = {}
+    for class_name in LABEL_NAMES.values():
+        patient_class_means[class_name] = {
+            metric: _mean_present(
+                [
+                    _mean_present(
+                        [
+                            record["per_class"][class_name][metric]
+                            for record in patient_records
+                        ]
+                    )
+                    for patient_records in records_by_patient.values()
+                ]
+            )
+            for metric in ("dice", "iou")
+        }
     return {
         "num_cases": len(records),
+        "num_patients": len(records_by_patient),
         "mean_inference_ms": float(statistics.fmean(inference_times)),
         "median_inference_ms": float(statistics.median(inference_times)),
         "mean_case_metrics": means,
         "mean_case_per_class": class_means,
+        "mean_patient_metrics": patient_metric_means,
+        "mean_patient_per_class": patient_class_means,
     }
 
 
@@ -461,6 +503,7 @@ def run_inference(
         {
             "checkpoint": str(checkpoint_path),
             "model": config["model"],
+            "input_mode": "2D axial slices" if isinstance(model, UNet2D) else "3D volumes",
             "checkpoint_epoch": int(checkpoint["epoch"]),
             "split": split_name,
             "device": str(device),

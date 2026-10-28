@@ -1,4 +1,4 @@
-"""Standard and improved 3D U-Net models for HipMRI segmentation."""
+"""Standard 2D, standard 3D, and improved 3D U-Net models for HipMRI."""
 
 from __future__ import annotations
 
@@ -8,6 +8,92 @@ from typing import Sequence
 import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
+
+
+class DoubleConv2D(nn.Module):
+    """Two convolution-normalisation-activation layers for the 2D baseline."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.block(inputs)
+
+
+class UpBlock2D(nn.Module):
+    """Upsample a 2D map, concatenate its encoder skip, and refine it."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.upsample = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size=2, stride=2
+        )
+        self.refine = DoubleConv2D(out_channels + skip_channels, out_channels)
+
+    def forward(self, inputs: Tensor, skip: Tensor) -> Tensor:
+        inputs = self.upsample(inputs)
+        if inputs.shape[2:] != skip.shape[2:]:
+            inputs = functional.interpolate(
+                inputs,
+                size=skip.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return self.refine(torch.cat((skip, inputs), dim=1))
+
+
+class UNet2D(nn.Module):
+    """Basic four-level 2D U-Net used as the slice-wise baseline."""
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        num_classes: int = 6,
+        base_channels: int = 16,
+    ) -> None:
+        super().__init__()
+        channels = [base_channels * (2**level) for level in range(5)]
+        self.encoder1 = DoubleConv2D(in_channels, channels[0])
+        self.encoder2 = DoubleConv2D(channels[0], channels[1])
+        self.encoder3 = DoubleConv2D(channels[1], channels[2])
+        self.encoder4 = DoubleConv2D(channels[2], channels[3])
+        self.bottleneck = DoubleConv2D(channels[3], channels[4])
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.decoder4 = UpBlock2D(channels[4], channels[3], channels[3])
+        self.decoder3 = UpBlock2D(channels[3], channels[2], channels[2])
+        self.decoder2 = UpBlock2D(channels[2], channels[1], channels[1])
+        self.decoder1 = UpBlock2D(channels[1], channels[0], channels[0])
+        self.segmentation_head = nn.Conv2d(
+            channels[0], num_classes, kernel_size=1
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        _validate_2d_input(inputs)
+        encoder1 = self.encoder1(inputs)
+        encoder2 = self.encoder2(self.pool(encoder1))
+        encoder3 = self.encoder3(self.pool(encoder2))
+        encoder4 = self.encoder4(self.pool(encoder3))
+        bottleneck = self.bottleneck(self.pool(encoder4))
+
+        decoder4 = self.decoder4(bottleneck, encoder4)
+        decoder3 = self.decoder3(decoder4, encoder3)
+        decoder2 = self.decoder2(decoder3, encoder2)
+        decoder1 = self.decoder1(decoder2, encoder1)
+        return self.segmentation_head(decoder1)
 
 
 class DoubleConv3D(nn.Module):
@@ -124,7 +210,7 @@ class UNet3D(nn.Module):
         self.segmentation_head = nn.Conv3d(channels[0], num_classes, kernel_size=1)
 
     def forward(self, inputs: Tensor) -> Tensor:
-        _validate_input(inputs)
+        _validate_3d_input(inputs)
         encoder1 = self.encoder1(inputs)
         encoder2 = self.encoder2(self.pool(encoder1))
         encoder3 = self.encoder3(self.pool(encoder2))
@@ -182,7 +268,7 @@ class ImprovedUNet3D(nn.Module):
         self.auxiliary_head3 = nn.Conv3d(channels[2], num_classes, kernel_size=1)
 
     def forward(self, inputs: Tensor) -> Tensor | tuple[Tensor, ...]:
-        _validate_input(inputs)
+        _validate_3d_input(inputs)
         encoder1 = self.encoder1(inputs)
         encoder2 = self.encoder2(self.down1(encoder1))
         encoder3 = self.encoder3(self.down2(encoder2))
@@ -229,7 +315,17 @@ def _downsample(in_channels: int, out_channels: int) -> nn.Sequential:
     )
 
 
-def _validate_input(inputs: Tensor) -> None:
+def _validate_2d_input(inputs: Tensor) -> None:
+    if inputs.ndim != 4:
+        raise ValueError(
+            "Expected input shape (batch, channels, height, width), "
+            f"received {tuple(inputs.shape)}."
+        )
+    if any(dimension < 16 for dimension in inputs.shape[2:]):
+        raise ValueError("Every spatial input dimension must be at least 16 pixels.")
+
+
+def _validate_3d_input(inputs: Tensor) -> None:
     if inputs.ndim != 5:
         raise ValueError(
             "Expected input shape (batch, channels, depth, height, width), "
@@ -246,8 +342,14 @@ def build_model(
     base_channels: int = 16,
     deep_supervision: bool = True,
 ) -> nn.Module:
-    """Build the baseline or improved model from a stable configuration API."""
+    """Build one of the three comparison models from a stable API."""
     normalised_name = model_name.lower().replace("-", "_")
+    if normalised_name in {"2d", "baseline2d", "unet2d"}:
+        return UNet2D(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+        )
     if normalised_name in {"baseline", "unet", "unet3d"}:
         return UNet3D(
             in_channels=in_channels,
@@ -262,8 +364,14 @@ def build_model(
             deep_supervision=deep_supervision,
         )
     raise ValueError(
-        f"Unknown model '{model_name}'. Choose 'baseline' or 'improved'."
+        f"Unknown model '{model_name}'. Choose '2d', 'baseline', or 'improved'."
     )
+
+
+def is_2d_model_name(model_name: str) -> bool:
+    """Return whether a saved or requested model name selects the 2D baseline."""
+    normalised_name = model_name.lower().replace("-", "_")
+    return normalised_name in {"2d", "baseline2d", "unet2d"}
 
 
 def count_trainable_parameters(model: nn.Module) -> int:
@@ -276,8 +384,9 @@ def _smoke_test(
     input_shape: tuple[int, int, int],
     base_channels: int,
 ) -> None:
-    sample = torch.randn(1, 1, *input_shape)
     for model_name in model_names:
+        sample_shape = input_shape[-2:] if is_2d_model_name(model_name) else input_shape
+        sample = torch.randn(1, 1, *sample_shape)
         model = build_model(model_name, base_channels=base_channels)
         model.eval()
         with torch.no_grad():
@@ -297,11 +406,11 @@ def _smoke_test(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Smoke-test the 3D U-Net models.")
+    parser = argparse.ArgumentParser(description="Smoke-test the HipMRI U-Net models.")
     parser.add_argument(
         "--model",
-        choices=("baseline", "improved", "both"),
-        default="both",
+        choices=("2d", "baseline", "improved", "all"),
+        default="all",
     )
     parser.add_argument(
         "--input-shape",
@@ -322,7 +431,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    model_names = ("baseline", "improved") if args.model == "both" else (args.model,)
+    model_names = (
+        ("2d", "baseline", "improved") if args.model == "all" else (args.model,)
+    )
     _smoke_test(
         model_names,
         input_shape=tuple(args.input_shape),

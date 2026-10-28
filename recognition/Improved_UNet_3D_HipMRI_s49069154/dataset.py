@@ -372,6 +372,16 @@ def _augment_training_pair(image: Any, label: Any) -> tuple[Any, Any]:
     return image.contiguous(), label.contiguous()
 
 
+def _augment_basic_pair(image: Any, label: Any) -> tuple[Any, Any]:
+    """Apply the left-right flip used by the original 3D comparison runs."""
+    import torch
+
+    if bool(torch.rand(()) < 0.5):
+        image = torch.flip(image, dims=(3,))
+        label = torch.flip(label, dims=(2,))
+    return image.contiguous(), label.contiguous()
+
+
 class HipMRIDataset(Dataset):
     """PyTorch-compatible dataset for aligned 3D HipMRI semantic segmentation."""
 
@@ -380,12 +390,16 @@ class HipMRIDataset(Dataset):
         pairs: Sequence[VolumePair],
         target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
         augment: bool = False,
+        augmentation_mode: str = "enhanced",
     ) -> None:
         if not pairs:
             raise ValueError("HipMRIDataset requires at least one volume pair.")
         self.pairs = tuple(pairs)
         self.target_shape = target_shape
         self.augment = augment
+        if augmentation_mode not in {"basic", "enhanced"}:
+            raise ValueError("augmentation_mode must be 'basic' or 'enhanced'.")
+        self.augmentation_mode = augmentation_mode
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -401,9 +415,14 @@ class HipMRIDataset(Dataset):
         )
 
         if self.augment:
-            image_tensor, label_tensor = _augment_training_pair(
-                image_tensor, label_tensor
-            )
+            if self.augmentation_mode == "basic":
+                image_tensor, label_tensor = _augment_basic_pair(
+                    image_tensor, label_tensor
+                )
+            else:
+                image_tensor, label_tensor = _augment_training_pair(
+                    image_tensor, label_tensor
+                )
 
         return {
             "image": image_tensor,
@@ -420,6 +439,7 @@ def build_datasets(
     data_root: str | Path,
     target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
     seed: int = 3710,
+    augmentation_mode: str = "enhanced",
 ) -> dict[str, HipMRIDataset]:
     """Build leakage-free training, validation, and test datasets."""
     pairs, missing_labels, missing_images = discover_volume_pairs(data_root)
@@ -431,7 +451,10 @@ def build_datasets(
     split = split_by_patient(pairs, seed=seed)
     return {
         "train": HipMRIDataset(
-            split.train, target_shape=target_shape, augment=True
+            split.train,
+            target_shape=target_shape,
+            augment=True,
+            augmentation_mode=augmentation_mode,
         ),
         "validation": HipMRIDataset(
             split.validation, target_shape=target_shape, augment=False

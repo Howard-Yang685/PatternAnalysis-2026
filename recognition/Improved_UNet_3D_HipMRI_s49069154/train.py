@@ -1,4 +1,4 @@
-"""Train and evaluate the baseline or improved 3D U-Net on HipMRI."""
+"""Train and evaluate the 2D, standard 3D, or improved 3D HipMRI U-Net."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from dataset import DEFAULT_DATA_ROOT, DEFAULT_TARGET_SHAPE, LABEL_NAMES, build_datasets
-from modules import build_model, count_trainable_parameters
+from modules import build_model, count_trainable_parameters, is_2d_model_name
 
 
 NUM_CLASSES = len(LABEL_NAMES)
@@ -47,6 +47,7 @@ class TrainingConfig:
     cross_entropy_weight: float
     dice_weight: float
     selection_metric: str
+    augmentation_mode: str
 
 
 class SegmentationMeter:
@@ -97,10 +98,12 @@ class SegmentationMeter:
 
 def soft_dice_loss(logits: Tensor, target: Tensor) -> Tensor:
     """Compute multiclass soft Dice loss while excluding background."""
+    if logits.ndim not in (4, 5):
+        raise ValueError(f"Expected 2D or 3D segmentation logits, got {logits.shape}.")
     probabilities = torch.softmax(logits, dim=1)
     one_hot_target = functional.one_hot(target, num_classes=NUM_CLASSES)
     one_hot_target = one_hot_target.movedim(-1, 1).to(probabilities.dtype)
-    reduction_dimensions = (0, 2, 3, 4)
+    reduction_dimensions = (0, *range(2, logits.ndim))
     intersection = torch.sum(
         probabilities * one_hot_target, dim=reduction_dimensions
     )
@@ -193,6 +196,7 @@ def build_loaders(
         data_root=config.data_root,
         target_shape=config.target_shape,
         seed=config.seed,
+        augmentation_mode=config.augmentation_mode,
     )
     generator = torch.Generator().manual_seed(config.seed)
     common_options = {
@@ -215,6 +219,27 @@ def build_loaders(
     }
 
 
+def prepare_model_batch(
+    image: Tensor,
+    target: Tensor,
+    two_dimensional: bool,
+) -> tuple[Tensor, Tensor]:
+    """Convert volume batches into ordered slice batches for the 2D baseline."""
+    if not two_dimensional:
+        return image, target
+    if image.ndim != 5 or target.ndim != 4:
+        raise ValueError(
+            "The 2D baseline expects volume batches shaped [B,C,D,H,W] and "
+            f"[B,D,H,W], received {tuple(image.shape)} and {tuple(target.shape)}."
+        )
+    batch, channels, depth, height, width = image.shape
+    slice_images = image.permute(0, 2, 1, 3, 4).reshape(
+        batch * depth, channels, height, width
+    )
+    slice_targets = target.reshape(batch * depth, height, width)
+    return slice_images.contiguous(), slice_targets.contiguous()
+
+
 def _limited_batches(
     loader: DataLoader,
     maximum_batches: int | None,
@@ -235,6 +260,7 @@ def train_epoch(
     class_weights: Tensor,
     cross_entropy_weight: float,
     dice_weight: float,
+    two_dimensional: bool = False,
     maximum_batches: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
     model.train()
@@ -245,6 +271,7 @@ def train_epoch(
     for batch in _limited_batches(loader, maximum_batches):
         image = batch["image"].to(device, non_blocking=True)
         target = batch["label"].to(device, non_blocking=True)
+        image, target = prepare_model_batch(image, target, two_dimensional)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(
@@ -284,6 +311,7 @@ def evaluate(
     class_weights: Tensor,
     cross_entropy_weight: float,
     dice_weight: float,
+    two_dimensional: bool = False,
     maximum_batches: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
     model.eval()
@@ -294,6 +322,7 @@ def evaluate(
     for batch in _limited_batches(loader, maximum_batches):
         image = batch["image"].to(device, non_blocking=True)
         target = batch["label"].to(device, non_blocking=True)
+        image, target = prepare_model_batch(image, target, two_dimensional)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
@@ -419,6 +448,7 @@ def run_training(
         dtype=torch.float32,
         device=device,
     )
+    two_dimensional = is_2d_model_name(config.model)
 
     checkpoint_path = output_dir / "best_model.pt"
     history: list[dict[str, float]] = []
@@ -430,8 +460,10 @@ def run_training(
     print(f"Trainable parameters: {count_trainable_parameters(model):,}")
     print(f"AMP enabled: {amp_enabled}")
     print(f"Target shape: {config.target_shape}")
+    print(f"Input mode: {'2D axial slices' if two_dimensional else '3D volumes'}")
     print(f"Class weights: {config.class_weights}")
     print(f"Checkpoint selection: {config.selection_metric}")
+    print(f"Training augmentation: {config.augmentation_mode}")
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -448,6 +480,7 @@ def run_training(
             class_weights,
             config.cross_entropy_weight,
             config.dice_weight,
+            two_dimensional=two_dimensional,
             maximum_batches=maximum_train_batches,
         )
         validation_loss, validation_metrics = evaluate(
@@ -458,6 +491,7 @@ def run_training(
             class_weights,
             config.cross_entropy_weight,
             config.dice_weight,
+            two_dimensional=two_dimensional,
             maximum_batches=maximum_validation_batches,
         )
         validation_dice = validation_metrics["mean_foreground_dice"]
@@ -525,6 +559,7 @@ def run_training(
         class_weights,
         config.cross_entropy_weight,
         config.dice_weight,
+        two_dimensional=two_dimensional,
         maximum_batches=maximum_test_batches,
     )
     peak_vram_mb = (
@@ -551,9 +586,11 @@ def run_training(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a baseline or improved 3D U-Net on HipMRI."
+        description="Train a 2D, standard 3D, or improved 3D U-Net on HipMRI."
     )
-    parser.add_argument("--model", choices=("baseline", "improved"), default="improved")
+    parser.add_argument(
+        "--model", choices=("2d", "baseline", "improved"), default="improved"
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument(
         "--output-dir",
@@ -596,6 +633,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("prostate_dice", "mean_foreground_dice"),
         default="prostate_dice",
         help="Validation metric used for LR scheduling, early stopping, and checkpoints.",
+    )
+    parser.add_argument(
+        "--augmentation",
+        choices=("basic", "enhanced"),
+        default="enhanced",
+        help="basic reproduces the original left-right flip; enhanced adds affine and intensity transforms.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument(
@@ -658,6 +701,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cross_entropy_weight=args.cross_entropy_weight,
         dice_weight=args.dice_weight,
         selection_metric=args.selection_metric,
+        augmentation_mode=args.augmentation,
     )
     set_reproducibility(config.seed)
     device = select_device(args.device)
