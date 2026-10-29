@@ -79,7 +79,13 @@ The Basic 2D U-Net uses four encoder and decoder levels with Conv2d, Instance No
 
 ![Training curves](assets/figure_4_training_curves.png)
 
-Dice is `2 TP / (2 TP + FP + FN)` and IoU is `TP / (TP + FP + FN)`. Patient means first average repeated scans for each patient. Apex and base Dice use three-slice bands at the inferior and superior ends of the reference prostate.
+Dice is `2 TP / (2 TP + FP + FN)` and IoU is
+`TP / (TP + FP + FN)`. Pooled metrics combine all test voxels, scan means
+weight every MRI equally, and patient means first average repeated scans within
+each patient. Patient means are the primary comparison because several patients
+have multiple weekly scans. Apex and base Dice use three-slice bands at the
+inferior and superior ends of the reference prostate. Paired patient bootstrap
+intervals use 100,000 resamples and seed 3710.
 
 ## Quantitative Results
 
@@ -143,7 +149,21 @@ The 2D implementation processes 64 slices as one effective batch, so fewer param
 
 ![W029 difference overlays](assets/figure_9_w029_errors.png)
 
-W029 Week5 is difficult for every model. Prostate Dice was 0.532 for 2D, 0.632 for Standard 3D, and 0.598 for Improved 3D. The 2D model missed the base band completely. This case remains unsuitable for automated drafting.
+W029 Week5 is difficult for every model. Prostate Dice was 0.532 for 2D,
+0.632 for Standard 3D, and 0.598 for Improved 3D. The 2D model missed the
+three-slice base band completely. Both 3D models recovered part of the superior
+contour, but their case scores remain too low for automatic drafting.
+
+The apex remains partly visible to all models, but the base contains a much
+smaller target beside bright bladder anatomy. The 2D model has no evidence from
+adjacent slices that the prostate should continue into this level. The improved
+model can recover the selected base slice, yet its low band and case scores show
+that this recovery is not consistent through the volume.
+
+**Operational decision:** route this case to a specialist. A global Dice
+threshold alone does not describe the location or clinical direction of the
+error. The system should expose base and apex checks separately and retain the
+MRI, prediction, and difference overlay for review.
 
 ### B037 Week0
 
@@ -151,19 +171,82 @@ W029 Week5 is difficult for every model. Prostate Dice was 0.532 for 2D, 0.632 f
 
 ![B037 difference overlays](assets/figure_11_b037_errors.png)
 
-B037 Week0 shows the clearest 3D recovery. Prostate Dice increased from 0.583 for 2D to 0.781 for Standard 3D and 0.791 for Improved 3D.
+B037 Week0 shows the clearest overall 3D gain. Prostate Dice increased from
+0.583 for 2D to 0.781 for Standard 3D and 0.791 for Improved 3D. The 2D
+prediction omitted the base band, while the improved model recovered more of
+the superior boundary. Even here, the last individual base slice remains
+incomplete, so this case still requires boundary review.
 
 ### M020 Week0
 
 ![M020 comparison](assets/figure_12_m020_comparison.png)
 
-M020 Week0 is a counterexample: 2D Dice was 0.847, Standard 3D was 0.833, and Improved 3D was 0.806. The 3D benefit is concentrated in difficult boundaries rather than every patient.
+M020 Week0 prevents an overly broad claim that 3D always wins. Whole-volume
+prostate Dice was 0.847 for 2D, 0.833 for Standard 3D, and 0.806 for Improved
+3D. The organ is clear through much of this scan and a single slice supplies
+enough local contrast. The 3D advantage appears mainly in difficult boundary
+cases, not uniformly in every patient.
+
+#### M020 Week0 Difference Overlays
+
+![M020 difference overlays](assets/figure_13_m020_errors.png)
+
+Despite the high reported whole-volume scores, all three restored source-grid
+predictions missed the small prostate region on the exact first and last
+reference-positive slices, giving an apex-slice and base-slice Dice of 0.000.
+The blue false-negative regions in the difference overlays show why
+whole-volume Dice alone is insufficient for boundary safety assessment.
 
 ## Discussion and Engineering Recommendation
 
-Both 3D models improved the main target and reduced severe base errors. Improved 3D did not reliably beat Standard 3D. Use Standard 3D U-Net for the current specialist-reviewed prototype because it gives the highest patient-balanced prostate Dice with lower complexity than Improved 3D. Do not use any model for autonomous contour approval.
+### Five-Case Summary
 
-The main limitations are six test patients, correlated weekly scans, fixed-shape rather than spacing-aware resizing, and one random seed. Next experiments should use multiple patient splits and spacing-aware or prostate-focused preprocessing before adding further architecture complexity.
+| Case | 2D prostate | Standard 3D | Improved 3D | Interpretation |
+|---|---:|---:|---:|---|
+| W029 Week5 | 0.532 | 0.632 | 0.598 | All models weak; 2D misses base band |
+| B037 Week0 | 0.583 | 0.781 | 0.791 | Strong 3D recovery |
+| M015 Week0 | 0.647 | 0.705 | 0.791 | Improved model helps this patient |
+| W029 Week6 | 0.549 | 0.642 | 0.643 | Persistent difficult weekly scan |
+| M020 Week0 | 0.847 | 0.833 | 0.806 | Counterexample where 2D is strongest |
+
+### What the Evidence Supports
+
+Both 3D models improved patient-balanced prostate Dice by about 0.068 and
+reduced the most severe base errors. This result is anatomically plausible: the
+base and apex occupy few slices, so neighbouring levels help distinguish real
+continuation from local intensity ambiguity. Published multicentre evidence
+similarly reports lower performance at the apex and base than at the midgland
+[7].
+
+The evidence does not support a reliable benefit from the additional
+improved-model components. Residual blocks and deep supervision made
+optimisation feasible and slightly improved pooled prostate Dice, but scan and
+patient means were effectively tied with the standard model. A systematic
+review of 48 prostate MRI studies also found no statistically significant mean
+Dice difference among common U-Net, ResNet, and DenseNet families [6].
+
+### Engineering Recommendation
+
+Use Standard 3D U-Net for the current specialist-reviewed contour-drafting
+prototype. It gives the highest patient-balanced prostate Dice, uses fewer
+parameters than Improved 3D U-Net, and has lower measured latency. Do not use
+any model for autonomous contour approval. Route cases with low whole-prostate,
+base, or apex confidence to manual review, and always inspect the base and apex
+overlays.
+
+### Limitations and Next Experiments
+
+- Only six patients appear in the test set, so bootstrap intervals are coarse
+  and one split cannot prove general superiority.
+- Repeated scans are balanced in patient means but remain correlated
+  observations.
+- Fixed-shape resizing does not preserve physical voxel spacing and may remove
+  thin through-plane detail.
+- The experiment uses one seed. Multiple patient-level splits or
+  cross-validation would test stability.
+- A prostate-focused region-of-interest stage or spacing-aware resampling is a
+  more targeted next experiment than further increasing architecture
+  complexity.
 
 ## Reproducibility
 
@@ -214,9 +297,9 @@ train/validation/test. Repeated scans from one patient remain in one partition.
 
 ### Exact Commands for the Reported Training Runs
 
-The current program defaults describe a later enhanced configuration. The
-following explicit arguments reproduce the configuration used for the results
-reported above and recorded in the three experiment `config.json` files.
+The program defaults and the following explicit arguments reproduce the
+configuration used for the results reported above and recorded in the three
+experiment `config.json` files.
 
 ```powershell
 $dataRoot = "F:\COMP3710_Data\HipMRI_Study_open"

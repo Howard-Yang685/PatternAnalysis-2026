@@ -32,9 +32,9 @@ LABEL_NAMES = {
     4: "rectum",
     5: "prostate",
 }
-# Retain more small-organ and boundary detail than the original 64 x 128 x 128
-# setting while remaining practical on a 12 GB consumer GPU.
-DEFAULT_TARGET_SHAPE = (80, 128, 128)  # (depth, height, width)
+# Input shape used by the three controlled experiments reported in the README
+# and PDF.
+DEFAULT_TARGET_SHAPE = (64, 128, 128)  # (depth, height, width)
 DEFAULT_DATA_ROOT = Path(
     os.environ.get(
         "HIPMRI_DATA_ROOT",
@@ -390,7 +390,7 @@ class HipMRIDataset(Dataset):
         pairs: Sequence[VolumePair],
         target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
         augment: bool = False,
-        augmentation_mode: str = "enhanced",
+        augmentation_mode: str = "basic",
     ) -> None:
         if not pairs:
             raise ValueError("HipMRIDataset requires at least one volume pair.")
@@ -439,7 +439,7 @@ def build_datasets(
     data_root: str | Path,
     target_shape: tuple[int, int, int] | None = DEFAULT_TARGET_SHAPE,
     seed: int = 3710,
-    augmentation_mode: str = "enhanced",
+    augmentation_mode: str = "basic",
 ) -> dict[str, HipMRIDataset]:
     """Build leakage-free training, validation, and test datasets."""
     pairs, missing_labels, missing_images = discover_volume_pairs(data_root)

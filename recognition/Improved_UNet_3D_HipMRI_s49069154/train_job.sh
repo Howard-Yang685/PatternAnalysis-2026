@@ -12,9 +12,17 @@
 set -euo pipefail
 
 MODEL="${1:-}"
-if [[ "$MODEL" != "baseline" && "$MODEL" != "improved" ]]; then
-  echo "Usage: sbatch train_job.sh baseline|improved" >&2
+if [[ "$MODEL" != "2d" && "$MODEL" != "baseline" && "$MODEL" != "improved" ]]; then
+  echo "Usage: sbatch train_job.sh 2d|baseline|improved" >&2
   exit 2
+fi
+
+if [[ "$MODEL" == "2d" ]]; then
+  OUTPUT_DIR="results/2d_baseline"
+  NUM_WORKERS=2
+else
+  OUTPUT_DIR="results/${MODEL}"
+  NUM_WORKERS=0
 fi
 
 source "$HOME/miniconda3/bin/activate"
@@ -28,12 +36,16 @@ python -u train.py \
   --batch-size 1 \
   --learning-rate 3e-4 \
   --weight-decay 1e-5 \
-  --base-channels 12 \
-  --target-shape 80 128 128 \
-  --num-workers 4 \
+  --base-channels 16 \
+  --target-shape 64 128 128 \
+  --num-workers "$NUM_WORKERS" \
   --seed 3710 \
   --patience 20 \
+  --class-weights 1 1 1 1 1 1 \
+  --cross-entropy-weight 0.5 \
+  --dice-weight 0.5 \
   --device cuda \
   --amp \
-  --selection-metric prostate_dice \
-  --output-dir "results/${MODEL}_enhanced"
+  --selection-metric mean_foreground_dice \
+  --augmentation basic \
+  --output-dir "$OUTPUT_DIR"

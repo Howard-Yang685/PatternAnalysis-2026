@@ -20,10 +20,9 @@ from modules import build_model, count_trainable_parameters, is_2d_model_name
 
 
 NUM_CLASSES = len(LABEL_NAMES)
-# Derived from the training-set class frequencies using a deliberately capped,
-# inverse-frequency-style weighting. This reduces background dominance without
-# allowing the two smallest structures to destabilise optimisation.
-DEFAULT_CLASS_WEIGHTS = (0.10, 0.20, 0.50, 1.00, 2.00, 2.50)
+# Uniform weights reproduce the controlled three-model comparison reported in
+# the README and PDF. Alternative class weighting remains available via CLI.
+DEFAULT_CLASS_WEIGHTS = (1.0,) * NUM_CLASSES
 
 
 @dataclass(frozen=True)
@@ -596,7 +595,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="Result directory (default: results/<model>_enhanced).",
+        help=(
+            "Result directory (default: results/2d_baseline for the 2D model "
+            "and results/<model> for the 3D models)."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -605,8 +607,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-channels",
         type=int,
-        default=12,
-        help="Base feature width (12 leaves memory for the enhanced resolution).",
+        default=16,
+        help="Base feature width (16 reproduces the reported experiments).",
     )
     parser.add_argument(
         "--target-shape",
@@ -615,7 +617,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TARGET_SHAPE,
         metavar=("DEPTH", "HEIGHT", "WIDTH"),
     )
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=3710)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument(
@@ -626,19 +628,19 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar=tuple(LABEL_NAMES.values()),
         help="Cross-entropy weights in semantic-label order.",
     )
-    parser.add_argument("--cross-entropy-weight", type=float, default=0.4)
-    parser.add_argument("--dice-weight", type=float, default=0.6)
+    parser.add_argument("--cross-entropy-weight", type=float, default=0.5)
+    parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument(
         "--selection-metric",
         choices=("prostate_dice", "mean_foreground_dice"),
-        default="prostate_dice",
+        default="mean_foreground_dice",
         help="Validation metric used for LR scheduling, early stopping, and checkpoints.",
     )
     parser.add_argument(
         "--augmentation",
         choices=("basic", "enhanced"),
-        default="enhanced",
-        help="basic reproduces the original left-right flip; enhanced adds affine and intensity transforms.",
+        default="basic",
+        help="basic reproduces the reported runs; enhanced adds affine and intensity transforms.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument(
@@ -681,12 +683,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cross_entropy_weight + args.dice_weight <= 0:
         raise ValueError("At least one loss-component weight must be positive.")
 
+    default_output_name = "2d_baseline" if args.model == "2d" else args.model
     config = TrainingConfig(
         model=args.model,
         data_root=str(args.data_root),
-        output_dir=str(
-            args.output_dir or Path("results") / f"{args.model}_enhanced"
-        ),
+        output_dir=str(args.output_dir or Path("results") / default_output_name),
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
