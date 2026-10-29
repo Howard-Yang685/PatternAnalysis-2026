@@ -167,13 +167,104 @@ The main limitations are six test patients, correlated weekly scans, fixed-shape
 
 ## Reproducibility
 
-- Python 3.11.17
-- PyTorch 2.13.0+cu132
-- Nibabel 5.4.2
-- NumPy 2.4.6
-- Matplotlib 3.11.2
-- NVIDIA GeForce RTX 5070 12 GB
-- Seed 3710
+### Verified Environment
+
+The reported experiments were run with Python 3.11.17, PyTorch
+2.13.0+cu132, Nibabel 5.4.2, NumPy 2.4.6, and Matplotlib 3.11.2 on an
+NVIDIA GeForce RTX 5070 with 12 GB VRAM. The random seed was 3710. A matching
+Windows PowerShell environment can be created with:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install torch==2.13.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+python -m pip install nibabel==5.4.2 numpy==2.4.6 matplotlib==3.11.2
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+Use the PyTorch wheel appropriate for the local CUDA driver if the verified
+CUDA 13.2 build is unavailable. This can change low-level numerical behaviour,
+so the exact package and GPU versions should be recorded with reproduced
+results.
+
+### Dataset Layout and Audit
+
+The data root is not committed to Git. It must contain the paired NIfTI files
+under the following directory names; subdirectories are searched recursively.
+
+```text
+HipMRI_Study_open/
+|-- semantic_MRs/
+|   `-- **/*_LFOV.nii.gz
+`-- semantic_labels_only/
+    `-- **/*_SEMANTIC.nii.gz
+```
+
+From this README's directory, audit pairing, affine/shape agreement, the fixed
+patient split, and one preprocessed sample before training:
+
+```powershell
+$dataRoot = "F:\COMP3710_Data\HipMRI_Study_open"
+python .\dataset.py --data-root $dataRoot --inspect-limit 5 --show-split --seed 3710 --smoke-test --target-shape 64 128 128
+```
+
+The expected split is 26/6/6 patients and 143/38/30 volumes for
+train/validation/test. Repeated scans from one patient remain in one partition.
+
+### Exact Commands for the Reported Training Runs
+
+The current program defaults describe a later enhanced configuration. The
+following explicit arguments reproduce the configuration used for the results
+reported above and recorded in the three experiment `config.json` files.
+
+```powershell
+$dataRoot = "F:\COMP3710_Data\HipMRI_Study_open"
+$common = @(
+    "--data-root", $dataRoot
+    "--epochs", "100"
+    "--batch-size", "1"
+    "--learning-rate", "0.0003"
+    "--weight-decay", "0.00001"
+    "--base-channels", "16"
+    "--target-shape", "64", "128", "128"
+    "--seed", "3710"
+    "--patience", "20"
+    "--class-weights", "1", "1", "1", "1", "1", "1"
+    "--cross-entropy-weight", "0.5"
+    "--dice-weight", "0.5"
+    "--selection-metric", "mean_foreground_dice"
+    "--augmentation", "basic"
+    "--device", "cuda"
+    "--amp"
+)
+
+python .\train.py --model 2d --num-workers 2 --output-dir .\results\2d_baseline @common
+python .\train.py --model baseline --num-workers 0 --output-dir .\results\baseline @common
+python .\train.py --model improved --num-workers 0 --output-dir .\results\improved @common
+```
+
+Run the three commands sequentially rather than concurrently. The class-weight
+order is background, bladder, body, bone, rectum, prostate. The worker-count
+difference reproduces the recorded runs and affects data loading rather than
+the patient split, model, loss, or evaluation definitions.
+
+### Held-Out Inference and Visualisation
+
+Each saved checkpoint contains its model type, input shape, feature width, and
+seed, so `predict.py` reconstructs the corresponding network automatically.
+
+```powershell
+python .\predict.py --checkpoint .\results\2d_baseline\best_model.pt --data-root $dataRoot --output-dir .\results\analysis_2d_baseline --split test --device cuda --num-visualisations 6 --save-nifti
+python .\predict.py --checkpoint .\results\baseline\best_model.pt --data-root $dataRoot --output-dir .\results\analysis_baseline --split test --device cuda --num-visualisations 6 --save-nifti
+python .\predict.py --checkpoint .\results\improved\best_model.pt --data-root $dataRoot --output-dir .\results\analysis_improved --split test --device cuda --num-visualisations 6 --save-nifti
+```
+
+Training writes `config.json`, `history.json`, `training_curves.png`,
+`best_model.pt`, and `results.json` to each model directory. Inference writes
+`case_metrics.csv`, `inference_summary.json`, restored NIfTI predictions under
+`predictions/`, and worst-case figures under `qualitative/`. The repository
+`.gitignore` excludes the dataset, `results/`, and trained weights.
 
 ## Artificial Intelligence Usage Disclosure
 
